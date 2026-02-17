@@ -7,7 +7,6 @@
 @Time: 2018/10/13 10:39 PM
 """
 
-
 from __future__ import print_function
 import os
 import argparse
@@ -17,13 +16,12 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from data import ModelNet40
-from model import PointNet, DGCNN
 import numpy as np
 from torch.utils.data import DataLoader
 from util import cal_loss, IOStream
 import sklearn.metrics as metrics
-
-
+from model import PointNet, DGCNN, CanonicalMLP
+import wandb
 def _init_():
     if not os.path.exists('checkpoints'):
         os.makedirs('checkpoints')
@@ -43,12 +41,16 @@ def train(args, io):
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
+    if args.cuda:
+        torch.backends.cuda.preferred_linalg_library('magma')
 
-    #Try to load models
+    # Try to load models
     if args.model == 'pointnet':
         model = PointNet(args).to(device)
     elif args.model == 'dgcnn':
         model = DGCNN(args).to(device)
+    elif args.model == 'canonical_mlp':
+        model = CanonicalMLP(args).to(device)  # <-- Load it here
     else:
         raise Exception("Not implemented")
     print(str(model))
@@ -69,7 +71,6 @@ def train(args, io):
 
     best_test_acc = 0
     for epoch in range(args.epochs):
-        scheduler.step()
         ####################
         # Train
         ####################
@@ -92,6 +93,8 @@ def train(args, io):
             train_loss += loss.item() * batch_size
             train_true.append(label.cpu().numpy())
             train_pred.append(preds.detach().cpu().numpy())
+
+        scheduler.step()
         train_true = np.concatenate(train_true)
         train_pred = np.concatenate(train_pred)
         outstr = 'Train %d, loss: %.6f, train acc: %.6f, train avg acc: %.6f' % (epoch,
@@ -101,7 +104,13 @@ def train(args, io):
                                                                                  metrics.balanced_accuracy_score(
                                                                                      train_true, train_pred))
         io.cprint(outstr)
-
+        # Log Training Metrics to W&B
+        wandb.log({
+            "epoch": epoch,
+            "train/loss": train_loss * 1.0 / count,
+            "train/acc": metrics.accuracy_score(train_true, train_pred),
+            "train/avg_acc": metrics.balanced_accuracy_score(train_true, train_pred)
+        })  # <-- No step argument here!
         ####################
         # Test
         ####################
@@ -132,7 +141,15 @@ def train(args, io):
         io.cprint(outstr)
         if test_acc >= best_test_acc:
             best_test_acc = test_acc
-            torch.save(model.state_dict(), 'checkpoints/%s/models/model.t7' % args.exp_name)
+            torch.save(model.state_dict(), 'checkpoints/%s/models/model.pt' % args.exp_name)
+            # Log Testing Metrics to W&B
+            wandb.log({
+                "epoch": epoch,  # <-- Make sure to include epoch here too
+                "test/loss": test_loss * 1.0 / count,
+                "test/acc": test_acc,
+                "test/avg_acc": avg_per_class_acc,
+                "test/best_acc": best_test_acc
+            })  # <-- No step argument here!
 
 
 def test(args, io):
@@ -140,11 +157,23 @@ def test(args, io):
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
+    if args.cuda:
+        torch.backends.cuda.preferred_linalg_library('magma')
 
-    #Try to load models
-    model = DGCNN(args).to(device)
+    # Try to load models dynamically based on args
+    if args.model == 'pointnet':
+        model = PointNet(args).to(device)
+    elif args.model == 'dgcnn':
+        model = DGCNN(args).to(device)
+    elif args.model == 'canonical_mlp':
+        model = CanonicalMLP(args).to(device)
+    else:
+        raise Exception("Not implemented")
+
     model = nn.DataParallel(model)
-    model.load_state_dict(torch.load(args.model_path))
+
+    # Best practice: use weights_only=True for safer loading
+    model.load_state_dict(torch.load(args.model_path, weights_only=True))
     model = model.eval()
     test_acc = 0.0
     count = 0.0
@@ -173,8 +202,8 @@ if __name__ == "__main__":
     parser.add_argument('--exp_name', type=str, default='exp', metavar='N',
                         help='Name of the experiment')
     parser.add_argument('--model', type=str, default='dgcnn', metavar='N',
-                        choices=['pointnet', 'dgcnn'],
-                        help='Model to use, [pointnet, dgcnn]')
+                        choices=['pointnet', 'dgcnn', 'canonical_mlp'],  # <-- Add it here
+                        help='Model to use, [pointnet, dgcnn, canonical_mlp]')
     parser.add_argument('--dataset', type=str, default='modelnet40', metavar='N',
                         choices=['modelnet40'])
     parser.add_argument('--batch_size', type=int, default=32, metavar='batch_size',
@@ -206,6 +235,14 @@ if __name__ == "__main__":
     parser.add_argument('--model_path', type=str, default='', metavar='N',
                         help='Pretrained model path')
     args = parser.parse_args()
+
+    # Initialize W&B
+    wandb.init(project="modelnet40-canon", name=args.exp_name, config=vars(args))
+
+    # --- ADD THESE TWO LINES ---
+    wandb.define_metric("epoch")
+    wandb.define_metric("*", step_metric="epoch")
+    # ---------------------------
 
     _init_()
 
