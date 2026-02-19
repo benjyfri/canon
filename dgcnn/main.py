@@ -9,6 +9,7 @@
 
 from __future__ import print_function
 import os
+import sys
 import argparse
 import torch
 import torch.nn as nn
@@ -22,6 +23,9 @@ from util import cal_loss, IOStream
 import sklearn.metrics as metrics
 from model import PointNet, DGCNN, CanonicalMLP, HybridDGCNN, HierarchicalCanonicalNet
 import wandb
+
+
+
 def _init_():
     if not os.path.exists('checkpoints'):
         os.makedirs('checkpoints')
@@ -95,6 +99,16 @@ def train(args, io):
             opt.zero_grad()
             logits = model(data)
             loss = criterion(logits, label)
+
+            # --- ADD THIS: The Fail-Fast Hard Stop ---
+            if torch.isnan(loss):
+                print(f"\nFATAL ERROR: NaN loss detected at Epoch {epoch}!")
+                print("Killing the Slurm job to save cluster compute time.")
+                # Optional: tell W&B the run failed before exiting
+                wandb.run.summary["status"] = "failed_due_to_nan"
+                sys.exit(1)
+                # -----------------------------------------
+
             loss.backward()
             opt.step()
             preds = logits.max(dim=1)[1]
