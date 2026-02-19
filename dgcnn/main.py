@@ -20,7 +20,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 from util import cal_loss, IOStream
 import sklearn.metrics as metrics
-from model import PointNet, DGCNN, CanonicalMLP
+from model import PointNet, DGCNN, CanonicalMLP, HybridDGCNN, HierarchicalCanonicalNet
 import wandb
 def _init_():
     if not os.path.exists('checkpoints'):
@@ -50,7 +50,16 @@ def train(args, io):
     elif args.model == 'dgcnn':
         model = DGCNN(args).to(device)
     elif args.model == 'canonical_mlp':
-        model = CanonicalMLP(args).to(device)  # <-- Load it here
+        model = CanonicalMLP(args).to(device)
+    elif args.model == 'hybrid_dgcnn':
+        model = HybridDGCNN(args).to(device)  # <-- Add this line
+    elif args.model == 'hierarchical_canonical':
+        model = HierarchicalCanonicalNet(
+            sampling=args.sampling,
+            k=args.k,
+            dropout=args.dropout
+            # You can also pass patch_mlps and final_mlp_dims here if you add them to argparse
+        ).to(device)
     else:
         raise Exception("Not implemented")
     print(str(model))
@@ -160,13 +169,22 @@ def test(args, io):
     if args.cuda:
         torch.backends.cuda.preferred_linalg_library('magma')
 
-    # Try to load models dynamically based on args
+    # Try to load models
     if args.model == 'pointnet':
         model = PointNet(args).to(device)
     elif args.model == 'dgcnn':
         model = DGCNN(args).to(device)
     elif args.model == 'canonical_mlp':
         model = CanonicalMLP(args).to(device)
+    elif args.model == 'hybrid_dgcnn':
+        model = HybridDGCNN(args).to(device)  # <-- Add this line
+    elif args.model == 'hierarchical_canonical':
+        model = HierarchicalCanonicalNet(
+            sampling=args.sampling,
+            k=args.k,
+            dropout=args.dropout
+            # You can also pass patch_mlps and final_mlp_dims here if you add them to argparse
+        ).to(device)
     else:
         raise Exception("Not implemented")
 
@@ -202,8 +220,13 @@ if __name__ == "__main__":
     parser.add_argument('--exp_name', type=str, default='exp', metavar='N',
                         help='Name of the experiment')
     parser.add_argument('--model', type=str, default='dgcnn', metavar='N',
-                        choices=['pointnet', 'dgcnn', 'canonical_mlp'],  # <-- Add it here
-                        help='Model to use, [pointnet, dgcnn, canonical_mlp]')
+                        choices=['pointnet', 'dgcnn', 'canonical_mlp', 'hybrid_dgcnn', 'hierarchical_canonical'],
+                        help='Model to use, [pointnet, dgcnn, canonical_mlp, hybrid_dgcnn, hierarchical_canonical]')
+    # Example of adding a custom argument for the new model
+    parser.add_argument('--sampling', type=int, nargs='+', default=[512, 128, 32],
+                        help='Hierarchical downsampling steps')
+    parser.add_argument('--patch_mlp_dims', type=int, nargs='+', default=[64, 64],
+                        help='Dimensions for the initial patch MLP layers (e.g., --patch_mlp_dims 64 64 128)')
     parser.add_argument('--dataset', type=str, default='modelnet40', metavar='N',
                         choices=['modelnet40'])
     parser.add_argument('--batch_size', type=int, default=32, metavar='batch_size',
