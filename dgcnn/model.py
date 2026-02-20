@@ -183,6 +183,60 @@ class Canonicalizer:
         signs = torch.where(signs == 0, torch.ones_like(signs), signs)
         return vecs * signs
 
+    # Add these inside the Canonicalizer class
+
+    @staticmethod
+    def get_fiedler_permutation(pc, sigma_kernel=3.0, epsilon=1e-8):
+        B, N, D = pc.shape
+        device = pc.device
+        dist_sq = torch.cdist(pc, pc, p=2).pow(2)
+        W = torch.exp(-dist_sq / (sigma_kernel ** 2))
+        W.diagonal(dim1=-2, dim2=-1).fill_(0)
+        D_vec = W.sum(dim=2) + epsilon
+        D_inv_sqrt = torch.rsqrt(D_vec)
+        W_norm = W * D_inv_sqrt.unsqueeze(1) * D_inv_sqrt.unsqueeze(2)
+        I = torch.eye(N, device=device).unsqueeze(0).expand(B, -1, -1)
+        L_sym = I - W_norm
+
+        vals, vecs = torch.linalg.eigh(L_sym)
+        fiedler = vecs[:, :, 1]
+
+        centered_fied = (fiedler - torch.mean(fiedler, axis=1).unsqueeze(-1))
+        skew = (centered_fied ** 3).mean(dim=1, keepdim=True)
+        signs = torch.sign(skew)
+        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+        fiedler = fiedler * signs
+
+        sorted_fiedler, perm = torch.sort(fiedler, dim=1)
+        return perm
+
+    @staticmethod
+    def spectral_fiedler(pc, sigma_kernel=1.0, epsilon=1e-8):
+        B, N, D = pc.shape
+        device = pc.device
+        centered = Canonicalizer._center(pc)
+
+        max_radii = (torch.max(torch.linalg.norm(centered, axis=2), axis=1))[0].unsqueeze(-1).unsqueeze(-1)
+        normalized_patches = centered / torch.clamp(max_radii, min=epsilon)
+
+        perm = Canonicalizer.get_fiedler_permutation(normalized_patches, sigma_kernel=sigma_kernel, epsilon=1e-8)
+        pc_ord = torch.gather(centered, 1, perm.unsqueeze(-1).expand(-1, -1, D))
+        weights = torch.linspace(-1, 1, N, device=device).view(1, N, 1)
+        moment_1 = (pc_ord * weights).sum(dim=1, keepdim=True)
+        moment_2 = (pc_ord * (weights ** 2)).sum(dim=1, keepdim=True) + epsilon
+        moment_3 = torch.cross(moment_1, moment_2, dim=2)
+        u1 = F.normalize(moment_1, dim=2, eps=epsilon)
+        u2_proj = moment_2 - (moment_2 * u1).sum(dim=2, keepdim=True) * u1
+        u2 = F.normalize(u2_proj, dim=2, eps=epsilon)
+        u3 = F.normalize(moment_3, dim=2, eps=epsilon)
+
+        R = torch.stack([u1.squeeze(1), u2.squeeze(1), u3.squeeze(1)], dim=-1)
+        R = Canonicalizer._enforce_so3(R)
+        canonical_pc = torch.bmm(pc_ord, R)
+
+        # UPDATE: Return R alongside canonical_pc and perm to support pose embedding
+        return canonical_pc, perm, R
+
     @staticmethod
     def _apply_data_signs(canonical_pc, R, s):
         s = torch.where(s == 0, torch.ones_like(s), s)
@@ -712,6 +766,129 @@ class HierarchicalCanonicalNet(nn.Module):
 
         # Catch all three returns even if we discard the global permutation and rotation
         xyz, _, _ = Canonicalizer.pca_skew(x_trans)
+
+        features = None
+
+        for stage in self.stages:
+            xyz, features = stage(xyz, features)
+
+        features_trans = features.transpose(1, 2).contiguous()
+        x_max = F.adaptive_max_pool1d(features_trans, 1).view(B, -1)
+        x_avg = F.adaptive_avg_pool1d(features_trans, 1).view(B, -1)
+        x_pool = torch.cat([x_max, x_avg], dim=1)
+
+        out = x_pool
+        for layer in self.fc_layers:
+            out = layer(out)
+
+        return out
+
+
+
+class SpectralPatchLayer(nn.Module):
+    def __init__(self, npoint, k, in_channels, mlp_dims, sigma_kernel=1.0):
+        super(SpectralPatchLayer, self).__init__()
+        self.npoint = npoint
+        self.k = k
+        self.sigma_kernel = sigma_kernel
+
+        current_dim = k * 3 if in_channels == 0 else k * (3 + in_channels)
+
+        mlp_layers = []
+        for out_dim in mlp_dims:
+            mlp_layers.append(nn.Conv1d(current_dim, out_dim, kernel_size=1, bias=False))
+            mlp_layers.append(nn.BatchNorm1d(out_dim))
+            mlp_layers.append(nn.LeakyReLU(negative_slope=0.2))
+            current_dim = out_dim
+
+        self.mlp = nn.Sequential(*mlp_layers)
+
+    def forward(self, xyz, features):
+        B, N, _ = xyz.shape
+
+        # 1. FPS Downsampling
+        fps_idx = farthest_point_sample(xyz, self.npoint)
+        new_xyz = index_points(xyz, fps_idx)
+
+        # 2. K-NN Grouping
+        sqrdists = square_distance(new_xyz, xyz)
+        _, knn_idx = torch.topk(sqrdists, self.k, dim=-1, largest=False, sorted=False)
+
+        grouped_xyz = index_points(xyz, knn_idx)
+        grouped_xyz_centered = grouped_xyz - new_xyz.unsqueeze(2)
+
+        # 3. Spectral Canonicalization
+        patch_pts = grouped_xyz_centered.view(B * self.npoint, self.k, 3)
+
+        # Catch the rotation matrix R using the new spectral_fiedler method
+        canon_pts, perm, R = Canonicalizer.spectral_fiedler(patch_pts, sigma_kernel=self.sigma_kernel)
+
+        # 4. Feature Alignment
+        if features is not None:
+            grouped_features = index_points(features, knn_idx)
+            patch_features = grouped_features.view(B * self.npoint, self.k, -1)
+            perm_features = perm.unsqueeze(-1).expand(-1, -1, patch_features.size(-1))
+            aligned_features = torch.gather(patch_features, 1, perm_features)
+            patch_data = torch.cat((canon_pts, aligned_features), dim=-1)
+        else:
+            patch_data = canon_pts
+
+        # 5. Flattening and MLP
+        patch_flat = patch_data.view(B, self.npoint, -1).transpose(1, 2).contiguous()
+        new_features = self.mlp(patch_flat)
+
+        # 6. Pose Embeddings (Centroid + Quaternion)
+        quat = matrix_to_quaternion(R)
+        quat = quat.view(B, self.npoint, 4).transpose(1, 2).contiguous()
+        centroid = new_xyz.transpose(1, 2).contiguous()
+
+        pose_7d = torch.cat([centroid, quat], dim=1)
+        new_features = torch.cat([new_features, pose_7d], dim=1)
+
+        return new_xyz, new_features.transpose(1, 2)
+
+class HierarchicalSpectralNet(nn.Module):
+    def __init__(self,
+                 sampling=[512, 128, 32],
+                 k=16,
+                 sigma_kernel=1.0,
+                 patch_mlps=[[64, 64, 128], [128, 128, 256], [256, 512, 1024]],
+                 final_mlp_dims=[512, 256],
+                 output_channels=40,
+                 dropout=0.5):
+        super(HierarchicalSpectralNet, self).__init__()
+
+        assert len(sampling) == len(patch_mlps), "Sampling steps must match patch_mlp stages."
+        self.k = k
+
+        self.stages = nn.ModuleList()
+        in_channels = 0
+
+        for npoint, mlp_dims in zip(sampling, patch_mlps):
+            # Use SpectralPatchLayer instead of CanonicalPatchLayer
+            self.stages.append(SpectralPatchLayer(npoint, k, in_channels, mlp_dims, sigma_kernel=sigma_kernel))
+            in_channels = mlp_dims[-1] + 7
+
+        self.fc_layers = nn.ModuleList()
+        last_dim = in_channels * 2
+
+        for d in final_mlp_dims:
+            self.fc_layers.append(nn.Linear(last_dim, d, bias=False))
+            self.fc_layers.append(nn.BatchNorm1d(d))
+            self.fc_layers.append(nn.LeakyReLU(negative_slope=0.2))
+            self.fc_layers.append(nn.Dropout(p=dropout))
+            last_dim = d
+
+        self.fc_layers.append(nn.Linear(last_dim, output_channels))
+
+    def forward(self, x):
+        B = x.shape[0]
+
+        # Global Pre-Canonicalization
+        x_trans = x.transpose(1, 2).contiguous()
+
+        # Use spectral_fiedler for the global point cloud canonicalization
+        xyz, _, _ = Canonicalizer.spectral_fiedler(x_trans)
 
         features = None
 

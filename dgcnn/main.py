@@ -10,7 +10,9 @@
 from __future__ import print_function
 import os
 import sys
+import ast
 import argparse
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,7 +23,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 from util import cal_loss, IOStream
 import sklearn.metrics as metrics
-from model import PointNet, DGCNN, CanonicalMLP, HybridDGCNN, HierarchicalCanonicalNet
+from model import PointNet, DGCNN, CanonicalMLP, HybridDGCNN, HierarchicalCanonicalNet, HierarchicalSpectralNet
 import wandb
 
 
@@ -45,8 +47,8 @@ def train(args, io):
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
-    if args.cuda:
-        torch.backends.cuda.preferred_linalg_library('magma')
+    # if args.cuda:
+    #     torch.backends.cuda.preferred_linalg_library('magma')
 
     # Try to load models
     if args.model == 'pointnet':
@@ -61,12 +63,20 @@ def train(args, io):
         model = HierarchicalCanonicalNet(
             sampling=args.sampling,
             k=args.k,
-            dropout=args.dropout
+            dropout=args.dropout,
+            patch_mlps=args.patch_mlps  # <--- Make sure this line is here!
             # You can also pass patch_mlps and final_mlp_dims here if you add them to argparse
+        ).to(device)
+    elif args.model == 'hierarchical_spectral':
+        model = HierarchicalSpectralNet(
+            sampling=args.sampling,
+            k=args.k,
+            dropout=args.dropout,
+            patch_mlps=args.patch_mlps,
+            sigma_kernel=args.sigma_kernel
         ).to(device)
     else:
         raise Exception("Not implemented")
-    print(str(model))
 
     model = nn.DataParallel(model)
     print("Let's use", torch.cuda.device_count(), "GPUs!")
@@ -92,7 +102,8 @@ def train(args, io):
         model.train()
         train_pred = []
         train_true = []
-        for data, label in train_loader:
+        train_bar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]", leave=False)
+        for data, label in train_bar:
             data, label = data.to(device), label.to(device).squeeze()
             data = data.permute(0, 2, 1)
             batch_size = data.size()[0]
@@ -196,8 +207,17 @@ def test(args, io):
         model = HierarchicalCanonicalNet(
             sampling=args.sampling,
             k=args.k,
-            dropout=args.dropout
+            dropout=args.dropout,
+            patch_mlps=args.patch_mlps  # <--- Make sure this line is here!
             # You can also pass patch_mlps and final_mlp_dims here if you add them to argparse
+        ).to(device)
+    elif args.model == 'hierarchical_spectral':
+        model = HierarchicalSpectralNet(
+            sampling=args.sampling,
+            k=args.k,
+            dropout=args.dropout,
+            patch_mlps=args.patch_mlps,
+            sigma_kernel=args.sigma_kernel
         ).to(device)
     else:
         raise Exception("Not implemented")
@@ -234,13 +254,21 @@ if __name__ == "__main__":
     parser.add_argument('--exp_name', type=str, default='exp', metavar='N',
                         help='Name of the experiment')
     parser.add_argument('--model', type=str, default='dgcnn', metavar='N',
-                        choices=['pointnet', 'dgcnn', 'canonical_mlp', 'hybrid_dgcnn', 'hierarchical_canonical'],
-                        help='Model to use, [pointnet, dgcnn, canonical_mlp, hybrid_dgcnn, hierarchical_canonical]')
+                        choices=['pointnet', 'dgcnn', 'canonical_mlp', 'hybrid_dgcnn', 'hierarchical_canonical',
+                                 'hierarchical_spectral'],
+                        help='Model to use, [pointnet, dgcnn, canonical_mlp, hybrid_dgcnn, hierarchical_canonical, hierarchical_spectral]')
+    parser.add_argument('--sigma_kernel', type=float, default=1.0,
+                        help='Sigma for the Gaussian kernel in the spectral Fiedler computation')
     # Example of adding a custom argument for the new model
     parser.add_argument('--sampling', type=int, nargs='+', default=[512, 128, 32],
                         help='Hierarchical downsampling steps')
     parser.add_argument('--patch_mlp_dims', type=int, nargs='+', default=[64, 64],
                         help='Dimensions for the initial patch MLP layers (e.g., --patch_mlp_dims 64 64 128)')
+    # --- ADD THIS NEW BLOCK ---
+    parser.add_argument('--patch_mlps', type=ast.literal_eval,
+                        default=[[64, 64, 128], [128, 128, 256], [256, 512, 1024]],
+                        help='Nested list of MLP dimensions for the hierarchical stages')
+    # --------------------------
     parser.add_argument('--dataset', type=str, default='modelnet40', metavar='N',
                         choices=['modelnet40'])
     parser.add_argument('--batch_size', type=int, default=32, metavar='batch_size',
