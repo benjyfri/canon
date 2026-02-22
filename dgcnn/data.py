@@ -7,7 +7,6 @@
 @Time: 2018/10/13 6:21 PM
 """
 
-
 import os
 import sys
 import glob
@@ -35,7 +34,7 @@ def load_data(partition):
     DATA_DIR = os.path.join(BASE_DIR, 'data')
     all_data = []
     all_label = []
-    for h5_name in glob.glob(os.path.join(DATA_DIR, 'modelnet40_ply_hdf5_2048', 'ply_data_%s*.h5'%partition)):
+    for h5_name in glob.glob(os.path.join(DATA_DIR, 'modelnet40_ply_hdf5_2048', 'ply_data_%s*.h5' % partition)):
         f = h5py.File(h5_name)
         data = f['data'][:].astype('float32')
         label = f['label'][:].astype('int64')
@@ -48,30 +47,50 @@ def load_data(partition):
 
 
 def translate_pointcloud(pointcloud):
-    xyz1 = np.random.uniform(low=2./3., high=3./2., size=[3])
+    xyz1 = np.random.uniform(low=2. / 3., high=3. / 2., size=[3])
     xyz2 = np.random.uniform(low=-0.2, high=0.2, size=[3])
-       
+
     translated_pointcloud = np.add(np.multiply(pointcloud, xyz1), xyz2).astype('float32')
     return translated_pointcloud
 
 
 def jitter_pointcloud(pointcloud, sigma=0.01, clip=0.02):
     N, C = pointcloud.shape
-    pointcloud += np.clip(sigma * np.random.randn(N, C), -1*clip, clip)
+    pointcloud += np.clip(sigma * np.random.randn(N, C), -1 * clip, clip)
     return pointcloud
+
+
+# --- NEW: Self-Centering Rotation Function ---
+def rotate_pointcloud(pointcloud):
+    # 1. Find the current center of the point cloud
+    centroid = np.mean(pointcloud, axis=0)
+
+    # 2. Shift to the origin
+    centered_pc = pointcloud - centroid
+
+    # 3. Apply the random Y-axis rotation
+    theta = np.pi * 2 * np.random.uniform()
+    rotation_matrix = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+    centered_pc[:, [0, 2]] = centered_pc[:, [0, 2]].dot(rotation_matrix)
+
+    # 4. Shift back to the original translated position
+    final_pc = centered_pc + centroid
+
+    return final_pc.astype('float32')
 
 
 class ModelNet40(Dataset):
     def __init__(self, num_points, partition='train'):
         self.data, self.label = load_data(partition)
         self.num_points = num_points
-        self.partition = partition        
+        self.partition = partition
 
     def __getitem__(self, item):
         pointcloud = self.data[item][:self.num_points]
         label = self.label[item]
         if self.partition == 'train':
             pointcloud = translate_pointcloud(pointcloud)
+            pointcloud = rotate_pointcloud(pointcloud)
             np.random.shuffle(pointcloud)
         return pointcloud, label
 

@@ -26,133 +26,6 @@ def knn(x, k):
     idx = pairwise_distance.topk(k=k, dim=-1)[1]   # (batch_size, num_points, k)
     return idx
 
-
-def get_graph_feature(x, k=20, idx=None):
-    batch_size = x.size(0)
-    num_points = x.size(2)
-    x = x.view(batch_size, -1, num_points)
-    if idx is None:
-        idx = knn(x, k=k)   # (batch_size, num_points, k)
-    device = x.device
-
-    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1)*num_points
-
-    idx = idx + idx_base
-
-    idx = idx.view(-1)
- 
-    _, num_dims, _ = x.size()
-
-    x = x.transpose(2, 1).contiguous()   # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
-    feature = x.view(batch_size*num_points, -1)[idx, :]
-    feature = feature.view(batch_size, num_points, k, num_dims) 
-    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
-    
-    feature = torch.cat((feature-x, x), dim=3).permute(0, 3, 1, 2).contiguous()
-  
-    return feature
-
-
-class PointNet(nn.Module):
-    def __init__(self, args, output_channels=40):
-        super(PointNet, self).__init__()
-        self.args = args
-        self.conv1 = nn.Conv1d(3, 64, kernel_size=1, bias=False)
-        self.conv2 = nn.Conv1d(64, 64, kernel_size=1, bias=False)
-        self.conv3 = nn.Conv1d(64, 64, kernel_size=1, bias=False)
-        self.conv4 = nn.Conv1d(64, 128, kernel_size=1, bias=False)
-        self.conv5 = nn.Conv1d(128, args.emb_dims, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.bn3 = nn.BatchNorm1d(64)
-        self.bn4 = nn.BatchNorm1d(128)
-        self.bn5 = nn.BatchNorm1d(args.emb_dims)
-        self.linear1 = nn.Linear(args.emb_dims, 512, bias=False)
-        self.bn6 = nn.BatchNorm1d(512)
-        self.dp1 = nn.Dropout()
-        self.linear2 = nn.Linear(512, output_channels)
-
-    def forward(self, x):
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = F.relu(self.bn4(self.conv4(x)))
-        x = F.relu(self.bn5(self.conv5(x)))
-        x = F.adaptive_max_pool1d(x, 1).squeeze()
-        x = F.relu(self.bn6(self.linear1(x)))
-        x = self.dp1(x)
-        x = self.linear2(x)
-        return x
-
-
-class DGCNN(nn.Module):
-    def __init__(self, args, output_channels=40):
-        super(DGCNN, self).__init__()
-        self.args = args
-        self.k = args.k
-        
-        self.bn1 = nn.BatchNorm2d(64)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.bn3 = nn.BatchNorm2d(128)
-        self.bn4 = nn.BatchNorm2d(256)
-        self.bn5 = nn.BatchNorm1d(args.emb_dims)
-
-        self.conv1 = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
-                                   self.bn1,
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv2 = nn.Sequential(nn.Conv2d(64*2, 64, kernel_size=1, bias=False),
-                                   self.bn2,
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv3 = nn.Sequential(nn.Conv2d(64*2, 128, kernel_size=1, bias=False),
-                                   self.bn3,
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv4 = nn.Sequential(nn.Conv2d(128*2, 256, kernel_size=1, bias=False),
-                                   self.bn4,
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv5 = nn.Sequential(nn.Conv1d(512, args.emb_dims, kernel_size=1, bias=False),
-                                   self.bn5,
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.linear1 = nn.Linear(args.emb_dims*2, 512, bias=False)
-        self.bn6 = nn.BatchNorm1d(512)
-        self.dp1 = nn.Dropout(p=args.dropout)
-        self.linear2 = nn.Linear(512, 256)
-        self.bn7 = nn.BatchNorm1d(256)
-        self.dp2 = nn.Dropout(p=args.dropout)
-        self.linear3 = nn.Linear(256, output_channels)
-
-    def forward(self, x):
-        batch_size = x.size(0)
-        x = get_graph_feature(x, k=self.k)
-        x = self.conv1(x)
-        x1 = x.max(dim=-1, keepdim=False)[0]
-
-        x = get_graph_feature(x1, k=self.k)
-        x = self.conv2(x)
-        x2 = x.max(dim=-1, keepdim=False)[0]
-
-        x = get_graph_feature(x2, k=self.k)
-        x = self.conv3(x)
-        x3 = x.max(dim=-1, keepdim=False)[0]
-
-        x = get_graph_feature(x3, k=self.k)
-        x = self.conv4(x)
-        x4 = x.max(dim=-1, keepdim=False)[0]
-
-        x = torch.cat((x1, x2, x3, x4), dim=1)
-
-        x = self.conv5(x)
-        x1 = F.adaptive_max_pool1d(x, 1).view(batch_size, -1)
-        x2 = F.adaptive_avg_pool1d(x, 1).view(batch_size, -1)
-        x = torch.cat((x1, x2), 1)
-
-        x = F.leaky_relu(self.bn6(self.linear1(x)), negative_slope=0.2)
-        x = self.dp1(x)
-        x = F.leaky_relu(self.bn7(self.linear2(x)), negative_slope=0.2)
-        x = self.dp2(x)
-        x = self.linear3(x)
-        return x
-
-
 class Canonicalizer:
     """
     Contract: All canonicalizers must return (canonical_pc, perm), where `perm` is
@@ -304,239 +177,6 @@ class Canonicalizer:
         # UPDATE: Return the final Rotation matrix as well
         return ordered, perm, R_final
 
-
-class CanonicalMLP(nn.Module):
-    def __init__(self, args, output_channels=40):
-        super(CanonicalMLP, self).__init__()
-        self.args = args
-        self.k = args.k
-
-        # MLPs on flattened ordered patches using 1D Convolutions
-        self.conv1 = nn.Sequential(nn.Conv1d(self.k * 3, 64, kernel_size=1, bias=False),
-                                   nn.BatchNorm1d(64),
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv2 = nn.Sequential(nn.Conv1d(self.k * (3 + 64), 64, kernel_size=1, bias=False),
-                                   nn.BatchNorm1d(64),
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv3 = nn.Sequential(nn.Conv1d(self.k * (3 + 64), 128, kernel_size=1, bias=False),
-                                   nn.BatchNorm1d(128),
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv4 = nn.Sequential(nn.Conv1d(self.k * (3 + 128), 256, kernel_size=1, bias=False),
-                                   nn.BatchNorm1d(256),
-                                   nn.LeakyReLU(negative_slope=0.2))
-
-        self.conv5 = nn.Sequential(nn.Conv1d(512, args.emb_dims, kernel_size=1, bias=False),
-                                   nn.BatchNorm1d(args.emb_dims),
-                                   nn.LeakyReLU(negative_slope=0.2))
-
-        self.linear1 = nn.Linear(args.emb_dims * 2, 512, bias=False)
-        self.bn6 = nn.BatchNorm1d(512)
-        self.dp1 = nn.Dropout(p=args.dropout)
-        self.linear2 = nn.Linear(512, 256)
-        self.bn7 = nn.BatchNorm1d(256)
-        self.dp2 = nn.Dropout(p=args.dropout)
-        self.linear3 = nn.Linear(256, output_channels)
-
-    def get_flattened_canonical_patch(self, pts, x, is_first_layer=False):
-        batch_size = x.size(0)
-        num_points = x.size(2)
-        x_dims = x.size(1)
-
-        x_trans = x.transpose(2, 1).contiguous()
-
-        # Find nearest neighbors dynamically (if first layer, operates on geometry)
-        idx = knn(x, k=self.k)
-
-        device = x.device
-        idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
-        idx = idx + idx_base
-        idx = idx.view(-1)
-
-        # Extract 3D geometry patches
-        pts_flat = pts.view(batch_size * num_points, 3)
-        patch_pts = pts_flat[idx, :].view(batch_size * num_points, self.k, 3)
-
-        # Canonicalize local 3D patch to guarantee stable ordering
-        canon_pts, perm, R_final = Canonicalizer.pca_skew(patch_pts)
-
-        if is_first_layer:
-            # First layer: just use the canonicalized shape
-            patch_feature = canon_pts.view(batch_size, num_points, self.k * 3)
-        else:
-            # Extract feature patches
-            x_flat = x_trans.view(batch_size * num_points, x_dims)
-            patch_x = x_flat[idx, :].view(batch_size * num_points, self.k, x_dims)
-
-            # Align features using geometry permutation
-            perm_x = perm.unsqueeze(-1).expand(-1, -1, x_dims)
-            aligned_x = torch.gather(patch_x, 1, perm_x)
-
-            # Concatenate local geometry + aligned features
-            patch_feature = torch.cat((canon_pts, aligned_x), dim=-1)
-            patch_feature = patch_feature.view(batch_size, num_points, self.k * (3 + x_dims))
-
-        # Permute to (B, channels, N) for the 1D convolution over points
-        patch_feature = patch_feature.permute(0, 2, 1).contiguous()
-        return patch_feature
-
-    def forward(self, x):
-        B, C, N = x.size()
-
-        # 1. Global Canonicalization
-        x_trans = x.transpose(1, 2).contiguous()  # (B, N, 3)
-        canon_x_trans, _ , R_final= Canonicalizer.pca_skew(x_trans)
-        pts = canon_x_trans  # Save base geometry for extracting local patches
-        x = canon_x_trans.transpose(1, 2).contiguous()  # (B, 3, N)
-
-        # 2. Patch Extraction & MLPs
-        x_patch1 = self.get_flattened_canonical_patch(pts, x, is_first_layer=True)
-        x1 = self.conv1(x_patch1)
-
-        x_patch2 = self.get_flattened_canonical_patch(pts, x1, is_first_layer=False)
-        x2 = self.conv2(x_patch2)
-
-        x_patch3 = self.get_flattened_canonical_patch(pts, x2, is_first_layer=False)
-        x3 = self.conv3(x_patch3)
-
-        x_patch4 = self.get_flattened_canonical_patch(pts, x3, is_first_layer=False)
-        x4 = self.conv4(x_patch4)
-
-        x_concat = torch.cat((x1, x2, x3, x4), dim=1)
-        x_out = self.conv5(x_concat)
-
-        # Global pooling
-        x_max = F.adaptive_max_pool1d(x_out, 1).view(B, -1)
-        x_avg = F.adaptive_avg_pool1d(x_out, 1).view(B, -1)
-        x_pool = torch.cat((x_max, x_avg), 1)
-
-        # Standard MLP
-        x_fc = F.leaky_relu(self.bn6(self.linear1(x_pool)), negative_slope=0.2)
-        x_fc = self.dp1(x_fc)
-        x_fc = F.leaky_relu(self.bn7(self.linear2(x_fc)), negative_slope=0.2)
-        x_fc = self.dp2(x_fc)
-        out = self.linear3(x_fc)
-
-        return out
-
-
-class HybridDGCNN(nn.Module):
-    def __init__(self, args, output_channels=40):
-        super(HybridDGCNN, self).__init__()
-        self.args = args
-        self.k = args.k
-
-        # 1. Modular MLP for PCA-Canonicalized 3D Patches
-        # Expects args.patch_mlp_dims to be a list of ints, e.g., [64, 64]
-        patch_mlp_dims = getattr(args, 'patch_mlp_dims', [64, 64])
-
-        mlp_layers = []
-        in_channels = self.k * 3
-        for out_channels in patch_mlp_dims:
-            mlp_layers.append(nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False))
-            mlp_layers.append(nn.BatchNorm1d(out_channels))
-            mlp_layers.append(nn.LeakyReLU(negative_slope=0.2))
-            in_channels = out_channels
-
-        self.patch_mlp = nn.Sequential(*mlp_layers)
-
-        # Output dimension of the patch MLP to feed into the rest of DGCNN
-        dgcnn_dim1 = patch_mlp_dims[-1]
-
-        # 2. Standard DGCNN architecture for the remaining latent embeddings
-        self.bn2 = nn.BatchNorm2d(64)
-        self.bn3 = nn.BatchNorm2d(128)
-        self.bn4 = nn.BatchNorm2d(256)
-        self.bn5 = nn.BatchNorm1d(args.emb_dims)
-
-        self.conv2 = nn.Sequential(nn.Conv2d(dgcnn_dim1 * 2, 64, kernel_size=1, bias=False),
-                                   self.bn2,
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv3 = nn.Sequential(nn.Conv2d(64 * 2, 128, kernel_size=1, bias=False),
-                                   self.bn3,
-                                   nn.LeakyReLU(negative_slope=0.2))
-        self.conv4 = nn.Sequential(nn.Conv2d(128 * 2, 256, kernel_size=1, bias=False),
-                                   self.bn4,
-                                   nn.LeakyReLU(negative_slope=0.2))
-
-        # conv5 concatenates the patch_mlp output + conv2 + conv3 + conv4
-        concat_dim = dgcnn_dim1 + 64 + 128 + 256
-        self.conv5 = nn.Sequential(nn.Conv1d(concat_dim, args.emb_dims, kernel_size=1, bias=False),
-                                   self.bn5,
-                                   nn.LeakyReLU(negative_slope=0.2))
-
-        self.linear1 = nn.Linear(args.emb_dims * 2, 512, bias=False)
-        self.bn6 = nn.BatchNorm1d(512)
-        self.dp1 = nn.Dropout(p=args.dropout)
-        self.linear2 = nn.Linear(512, 256)
-        self.bn7 = nn.BatchNorm1d(256)
-        self.dp2 = nn.Dropout(p=args.dropout)
-        self.linear3 = nn.Linear(256, output_channels)
-
-    def forward(self, x):
-        batch_size = x.size(0)
-        num_points = x.size(2)
-
-        # --- 1. First Layer: Extract, Canonicalize, and Embed Local 3D Patches ---
-        # Find nearest neighbors on raw 3D geometry
-        idx = knn(x, k=self.k)
-        device = x.device
-        idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
-        idx = idx + idx_base
-        idx = idx.view(-1)
-
-        # Extract 3D patches
-        x_trans = x.transpose(2, 1).contiguous()
-        x_flat = x_trans.view(batch_size * num_points, 3)
-        patch_pts = x_flat[idx, :].view(batch_size * num_points, self.k, 3)
-
-        # Canonicalize local patches (PCA + Skew + Sorting)
-        canon_pts, _ , R_final= Canonicalizer.pca_skew(patch_pts)
-
-        # Flatten the K points into a single 3*K vector for the MLP
-        # Output shape mapping: (B*N, K, 3) -> (B, N, K*3) -> (B, K*3, N)
-        canon_flat = canon_pts.view(batch_size, num_points, self.k * 3).permute(0, 2, 1).contiguous()
-
-        # Process through modular MLP to get patch embeddings
-        x1 = self.patch_mlp(canon_flat)
-
-        # --- 2. Rest of the layers: Standard DGCNN on Latent Embeddings ---
-        # Instead of 3D coords, EdgeConv now operates on the invariant x1 embeddings
-        x_latent = get_graph_feature(x1, k=self.k)
-        x_latent = self.conv2(x_latent)
-        x2 = x_latent.max(dim=-1, keepdim=False)[0]
-
-        x_latent = get_graph_feature(x2, k=self.k)
-        x_latent = self.conv3(x_latent)
-        x3 = x_latent.max(dim=-1, keepdim=False)[0]
-
-        x_latent = get_graph_feature(x3, k=self.k)
-        x_latent = self.conv4(x_latent)
-        x4 = x_latent.max(dim=-1, keepdim=False)[0]
-
-        # Concatenate x1 (patch embeddings) + x2 + x3 + x4
-        x_concat = torch.cat((x1, x2, x3, x4), dim=1)
-        x_features = self.conv5(x_concat)
-
-        # Global Pooling
-        x_max = F.adaptive_max_pool1d(x_features, 1).view(batch_size, -1)
-        x_avg = F.adaptive_avg_pool1d(x_features, 1).view(batch_size, -1)
-        x_pool = torch.cat((x_max, x_avg), 1)
-
-        # Final Classification Head
-        out = F.leaky_relu(self.bn6(self.linear1(x_pool)), negative_slope=0.2)
-        out = self.dp1(out)
-        out = F.leaky_relu(self.bn7(self.linear2(out)), negative_slope=0.2)
-        out = self.dp2(out)
-        out = self.linear3(out)
-
-        return out
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
 # ---------------------------------------------------------------------------
 # Highly Optimized PyTorch Utility Functions
 # ---------------------------------------------------------------------------
@@ -644,14 +284,16 @@ def farthest_point_sample(xyz, npoint):
 # Canonical Patch Convolution Layer
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Canonical & Spectral Patch Convolution Layers
+# ---------------------------------------------------------------------------
+
 class CanonicalPatchLayer(nn.Module):
     def __init__(self, npoint, k, in_channels, mlp_dims):
         super(CanonicalPatchLayer, self).__init__()
         self.npoint = npoint
         self.k = k
 
-        # The input channels correctly account for the +7 dimensions
-        # tracked and passed down from the previous layer via `in_channels`
         current_dim = k * 3 if in_channels == 0 else k * (3 + in_channels)
 
         mlp_layers = []
@@ -663,27 +305,21 @@ class CanonicalPatchLayer(nn.Module):
 
         self.mlp = nn.Sequential(*mlp_layers)
 
-    def forward(self, xyz, features):
+    def forward(self, xyz, features, fps_idx):
         B, N, _ = xyz.shape
 
-        # 1. FPS Downsampling
-        fps_idx = farthest_point_sample(xyz, self.npoint)
-        new_xyz = index_points(xyz, fps_idx)  # (B, npoint, 3)
+        # Use the externally provided indices
+        new_xyz = index_points(xyz, fps_idx)
 
-        # 2. K-NN Grouping
         sqrdists = square_distance(new_xyz, xyz)
         _, knn_idx = torch.topk(sqrdists, self.k, dim=-1, largest=False, sorted=False)
 
         grouped_xyz = index_points(xyz, knn_idx)
         grouped_xyz_centered = grouped_xyz - new_xyz.unsqueeze(2)
 
-        # 3. Canonicalization
         patch_pts = grouped_xyz_centered.view(B * self.npoint, self.k, 3)
+        canon_pts, perm, R = Canonicalizer.pca_skew(patch_pts)
 
-        # Catch the rotation matrix R
-        canon_pts, perm, R = Canonicalizer.pca_skew(patch_pts)  # R shape: (B*npoint, 3, 3)
-
-        # 4. Feature Alignment
         if features is not None:
             grouped_features = index_points(features, knn_idx)
             patch_features = grouped_features.view(B * self.npoint, self.k, -1)
@@ -693,96 +329,17 @@ class CanonicalPatchLayer(nn.Module):
         else:
             patch_data = canon_pts
 
-        # 5. Flattening and MLP
         patch_flat = patch_data.view(B, self.npoint, -1).transpose(1, 2).contiguous()
-        new_features = self.mlp(patch_flat)  # (B, out_C, npoint)
+        new_features = self.mlp(patch_flat)
 
-        # ---------------------------------------------------------
-        # 6. Pose Embeddings (Centroid + Quaternion)
-        # ---------------------------------------------------------
+        quat = matrix_to_quaternion(R)
+        quat = quat.view(B, self.npoint, 4).transpose(1, 2).contiguous()
+        centroid = new_xyz.transpose(1, 2).contiguous()
 
-        # Calculate Quaternion from Rotation Matrix
-        quat = matrix_to_quaternion(R)  # (B*npoint, 4)
-        quat = quat.view(B, self.npoint, 4).transpose(1, 2).contiguous()  # (B, 4, npoint)
-
-        # Prepare the centroid
-        centroid = new_xyz.transpose(1, 2).contiguous()  # (B, 3, npoint)
-
-        # Concatenate into a 7D Pose Block
-        pose_7d = torch.cat([centroid, quat], dim=1)  # (B, 7, npoint)
-
-        # Concatenate 7D Pose to the Semantic Features
-        new_features = torch.cat([new_features, pose_7d], dim=1)  # (B, out_C + 7, npoint)
+        pose_7d = torch.cat([centroid, quat], dim=1)
+        new_features = torch.cat([new_features, pose_7d], dim=1)
 
         return new_xyz, new_features.transpose(1, 2)
-
-
-# ---------------------------------------------------------------------------
-# Main Hierarchical Model
-# ---------------------------------------------------------------------------
-
-class HierarchicalCanonicalNet(nn.Module):
-    def __init__(self,
-                 sampling=[512, 128, 32],
-                 k=16,
-                 patch_mlps=[[64, 64, 128], [128, 128, 256], [256, 512, 1024]],
-                 final_mlp_dims=[512, 256],
-                 output_channels=40,
-                 dropout=0.5):
-        super(HierarchicalCanonicalNet, self).__init__()
-
-        assert len(sampling) == len(patch_mlps), "Sampling steps must match patch_mlp stages."
-        self.k = k
-
-        self.stages = nn.ModuleList()
-        in_channels = 0
-
-        for npoint, mlp_dims in zip(sampling, patch_mlps):
-            self.stages.append(CanonicalPatchLayer(npoint, k, in_channels, mlp_dims))
-
-            # The layer explicitly concatenates 7 channels (3 for centroid, 4 for quaternion)
-            # to the end of its output, so we must add 7 for the NEXT layer's input
-            in_channels = mlp_dims[-1] + 7
-
-        self.fc_layers = nn.ModuleList()
-
-        # in_channels now natively includes the +7 from the final stage
-        last_dim = in_channels * 2
-
-        for d in final_mlp_dims:
-            self.fc_layers.append(nn.Linear(last_dim, d, bias=False))
-            self.fc_layers.append(nn.BatchNorm1d(d))
-            self.fc_layers.append(nn.LeakyReLU(negative_slope=0.2))
-            self.fc_layers.append(nn.Dropout(p=dropout))
-            last_dim = d
-
-        self.fc_layers.append(nn.Linear(last_dim, output_channels))
-
-    def forward(self, x):
-        B = x.shape[0]
-
-        # Global Pre-Canonicalization
-        x_trans = x.transpose(1, 2).contiguous()
-
-        # Catch all three returns even if we discard the global permutation and rotation
-        xyz, _, _ = Canonicalizer.pca_skew(x_trans)
-
-        features = None
-
-        for stage in self.stages:
-            xyz, features = stage(xyz, features)
-
-        features_trans = features.transpose(1, 2).contiguous()
-        x_max = F.adaptive_max_pool1d(features_trans, 1).view(B, -1)
-        x_avg = F.adaptive_avg_pool1d(features_trans, 1).view(B, -1)
-        x_pool = torch.cat([x_max, x_avg], dim=1)
-
-        out = x_pool
-        for layer in self.fc_layers:
-            out = layer(out)
-
-        return out
-
 
 
 class SpectralPatchLayer(nn.Module):
@@ -803,27 +360,21 @@ class SpectralPatchLayer(nn.Module):
 
         self.mlp = nn.Sequential(*mlp_layers)
 
-    def forward(self, xyz, features):
+    def forward(self, xyz, features, fps_idx):
         B, N, _ = xyz.shape
 
-        # 1. FPS Downsampling
-        fps_idx = farthest_point_sample(xyz, self.npoint)
+        # Use the externally provided indices
         new_xyz = index_points(xyz, fps_idx)
 
-        # 2. K-NN Grouping
         sqrdists = square_distance(new_xyz, xyz)
         _, knn_idx = torch.topk(sqrdists, self.k, dim=-1, largest=False, sorted=False)
 
         grouped_xyz = index_points(xyz, knn_idx)
         grouped_xyz_centered = grouped_xyz - new_xyz.unsqueeze(2)
 
-        # 3. Spectral Canonicalization
         patch_pts = grouped_xyz_centered.view(B * self.npoint, self.k, 3)
-
-        # Catch the rotation matrix R using the new spectral_fiedler method
         canon_pts, perm, R = Canonicalizer.spectral_fiedler(patch_pts, sigma_kernel=self.sigma_kernel)
 
-        # 4. Feature Alignment
         if features is not None:
             grouped_features = index_points(features, knn_idx)
             patch_features = grouped_features.view(B * self.npoint, self.k, -1)
@@ -833,11 +384,9 @@ class SpectralPatchLayer(nn.Module):
         else:
             patch_data = canon_pts
 
-        # 5. Flattening and MLP
         patch_flat = patch_data.view(B, self.npoint, -1).transpose(1, 2).contiguous()
         new_features = self.mlp(patch_flat)
 
-        # 6. Pose Embeddings (Centroid + Quaternion)
         quat = matrix_to_quaternion(R)
         quat = quat.view(B, self.npoint, 4).transpose(1, 2).contiguous()
         centroid = new_xyz.transpose(1, 2).contiguous()
@@ -847,30 +396,40 @@ class SpectralPatchLayer(nn.Module):
 
         return new_xyz, new_features.transpose(1, 2)
 
-class HierarchicalSpectralNet(nn.Module):
+# ---------------------------------------------------------------------------
+# Main Hierarchical Models (Multi-Scale Aggregation)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Main Hierarchical Models (Upfront FPS & Index Composition)
+# ---------------------------------------------------------------------------
+
+class HierarchicalCanonicalNet(nn.Module):
     def __init__(self,
                  sampling=[512, 128, 32],
                  k=16,
-                 sigma_kernel=1.0,
                  patch_mlps=[[64, 64, 128], [128, 128, 256], [256, 512, 1024]],
                  final_mlp_dims=[512, 256],
                  output_channels=40,
                  dropout=0.5):
-        super(HierarchicalSpectralNet, self).__init__()
+        super(HierarchicalCanonicalNet, self).__init__()
 
         assert len(sampling) == len(patch_mlps), "Sampling steps must match patch_mlp stages."
         self.k = k
+        self.sampling = sampling  # Save sampling array for the upfront FPS loop
 
         self.stages = nn.ModuleList()
         in_channels = 0
+        accumulated_dim = 0
 
         for npoint, mlp_dims in zip(sampling, patch_mlps):
-            # Use SpectralPatchLayer instead of CanonicalPatchLayer
-            self.stages.append(SpectralPatchLayer(npoint, k, in_channels, mlp_dims, sigma_kernel=sigma_kernel))
-            in_channels = mlp_dims[-1] + 7
+            self.stages.append(CanonicalPatchLayer(npoint, k, in_channels, mlp_dims))
+            stage_out_channels = mlp_dims[-1] + 7
+            in_channels = stage_out_channels
+            accumulated_dim += stage_out_channels
 
         self.fc_layers = nn.ModuleList()
-        last_dim = in_channels * 2
+        last_dim = accumulated_dim * 2
 
         for d in final_mlp_dims:
             self.fc_layers.append(nn.Linear(last_dim, d, bias=False))
@@ -886,18 +445,149 @@ class HierarchicalSpectralNet(nn.Module):
 
         # Global Pre-Canonicalization
         x_trans = x.transpose(1, 2).contiguous()
+        xyz, _, _ = Canonicalizer.pca_skew(x_trans)
 
-        # Use spectral_fiedler for the global point cloud canonicalization
+        # ---------------------------------------------------------
+        # 1. UPFRONT KERNEL SCHEDULING (Pre-calculate all FPS indices)
+        # ---------------------------------------------------------
+        current_xyz = xyz
+        stage_fps_indices = []
+
+        for npoint in self.sampling:
+            fps_idx = farthest_point_sample(current_xyz, npoint)
+            stage_fps_indices.append(fps_idx)
+            current_xyz = index_points(current_xyz, fps_idx)
+
+        # ---------------------------------------------------------
+        # 2. SEQUENTIAL FEATURE COMPUTATION
+        # ---------------------------------------------------------
+        features = None
+        stage_features = []
+
+        for i, stage in enumerate(self.stages):
+            # Pass the pre-calculated index into the layer
+            xyz, features = stage(xyz, features, stage_fps_indices[i])
+            # Keep features as (B, N, C) so index_points slices the spatial dimension, not channels
+            stage_features.append(features)
+
+        # ---------------------------------------------------------
+        # 3. INDEX COMPOSITION & FEATURE EXTRACTION
+        # ---------------------------------------------------------
+        final_features = []
+        num_stages = len(self.stages)
+
+        for i in range(num_stages):
+            f = stage_features[i]
+
+            # If this isn't the final stage, map its features down to the 32 anchor points
+            if i < num_stages - 1:
+                idx = stage_fps_indices[i + 1]
+                for j in range(i + 2, num_stages):
+                    idx = torch.gather(idx, 1, stage_fps_indices[j])
+
+                # Slices out the 32 anchors in a single operation
+                f = index_points(f, idx)
+
+            final_features.append(f)
+
+        # ---------------------------------------------------------
+        # 4. POINT-WISE MULTI-SCALE POOLING
+        # ---------------------------------------------------------
+        # Concatenate along the channel dimension for the 32 points: (B, 32, accumulated_dim)
+        concat_features = torch.cat(final_features, dim=-1)
+
+        # Prepare for global pooling: (B, accumulated_dim, 32)
+        concat_features = concat_features.transpose(1, 2).contiguous()
+
+        x_max = F.adaptive_max_pool1d(concat_features, 1).view(B, -1)
+        x_avg = F.adaptive_avg_pool1d(concat_features, 1).view(B, -1)
+        x_pool = torch.cat([x_max, x_avg], dim=1)
+
+        out = x_pool
+        for layer in self.fc_layers:
+            out = layer(out)
+
+        return out
+
+
+class HierarchicalSpectralNet(nn.Module):
+    def __init__(self,
+                 sampling=[512, 128, 32],
+                 k=16,
+                 sigma_kernel=1.0,
+                 patch_mlps=[[64, 64, 128], [128, 128, 256], [256, 512, 1024]],
+                 final_mlp_dims=[512, 256],
+                 output_channels=40,
+                 dropout=0.5):
+        super(HierarchicalSpectralNet, self).__init__()
+
+        assert len(sampling) == len(patch_mlps), "Sampling steps must match patch_mlp stages."
+        self.k = k
+        self.sampling = sampling
+
+        self.stages = nn.ModuleList()
+        in_channels = 0
+        accumulated_dim = 0
+
+        for npoint, mlp_dims in zip(sampling, patch_mlps):
+            self.stages.append(SpectralPatchLayer(npoint, k, in_channels, mlp_dims, sigma_kernel=sigma_kernel))
+            stage_out_channels = mlp_dims[-1] + 7
+            in_channels = stage_out_channels
+            accumulated_dim += stage_out_channels
+
+        self.fc_layers = nn.ModuleList()
+        last_dim = accumulated_dim * 2
+
+        for d in final_mlp_dims:
+            self.fc_layers.append(nn.Linear(last_dim, d, bias=False))
+            self.fc_layers.append(nn.BatchNorm1d(d))
+            self.fc_layers.append(nn.LeakyReLU(negative_slope=0.2))
+            self.fc_layers.append(nn.Dropout(p=dropout))
+            last_dim = d
+
+        self.fc_layers.append(nn.Linear(last_dim, output_channels))
+
+    def forward(self, x):
+        B = x.shape[0]
+
+        x_trans = x.transpose(1, 2).contiguous()
         xyz, _, _ = Canonicalizer.spectral_fiedler(x_trans)
 
+        current_xyz = xyz
+        stage_fps_indices = []
+
+        for npoint in self.sampling:
+            fps_idx = farthest_point_sample(current_xyz, npoint)
+            stage_fps_indices.append(fps_idx)
+            current_xyz = index_points(current_xyz, fps_idx)
+
         features = None
+        stage_features = []
 
-        for stage in self.stages:
-            xyz, features = stage(xyz, features)
+        for i, stage in enumerate(self.stages):
+            xyz, features = stage(xyz, features, stage_fps_indices[i])
+            # Keep features as (B, N, C) so index_points slices the spatial dimension, not channels
+            stage_features.append(features)
 
-        features_trans = features.transpose(1, 2).contiguous()
-        x_max = F.adaptive_max_pool1d(features_trans, 1).view(B, -1)
-        x_avg = F.adaptive_avg_pool1d(features_trans, 1).view(B, -1)
+        final_features = []
+        num_stages = len(self.stages)
+
+        for i in range(num_stages):
+            f = stage_features[i]
+
+            if i < num_stages - 1:
+                idx = stage_fps_indices[i + 1]
+                for j in range(i + 2, num_stages):
+                    idx = torch.gather(idx, 1, stage_fps_indices[j])
+                f = index_points(f, idx)
+
+            final_features.append(f)
+
+        concat_features = torch.cat(final_features, dim=-1)
+        concat_features = concat_features.transpose(1, 2).contiguous()
+
+        x_max = F.adaptive_max_pool1d(concat_features, 1).view(B, -1)
+        x_avg = F.adaptive_avg_pool1d(concat_features, 1).view(B, -1)
         x_pool = torch.cat([x_max, x_avg], dim=1)
 
         out = x_pool

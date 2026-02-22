@@ -23,22 +23,22 @@ import numpy as np
 from torch.utils.data import DataLoader
 from util import cal_loss, IOStream
 import sklearn.metrics as metrics
-from model import PointNet, DGCNN, CanonicalMLP, HybridDGCNN, HierarchicalCanonicalNet, HierarchicalSpectralNet
+from model import HierarchicalCanonicalNet, HierarchicalSpectralNet
 import wandb
-
 
 
 def _init_():
     if not os.path.exists('checkpoints'):
         os.makedirs('checkpoints')
-    if not os.path.exists('checkpoints/'+args.exp_name):
-        os.makedirs('checkpoints/'+args.exp_name)
-    if not os.path.exists('checkpoints/'+args.exp_name+'/'+'models'):
-        os.makedirs('checkpoints/'+args.exp_name+'/'+'models')
-    os.system('cp main.py checkpoints'+'/'+args.exp_name+'/'+'main.py.backup')
+    if not os.path.exists('checkpoints/' + args.exp_name):
+        os.makedirs('checkpoints/' + args.exp_name)
+    if not os.path.exists('checkpoints/' + args.exp_name + '/' + 'models'):
+        os.makedirs('checkpoints/' + args.exp_name + '/' + 'models')
+    os.system('cp main.py checkpoints' + '/' + args.exp_name + '/' + 'main.py.backup')
     os.system('cp model.py checkpoints' + '/' + args.exp_name + '/' + 'model.py.backup')
     os.system('cp util.py checkpoints' + '/' + args.exp_name + '/' + 'util.py.backup')
     os.system('cp data.py checkpoints' + '/' + args.exp_name + '/' + 'data.py.backup')
+
 
 def train(args, io):
     train_loader = DataLoader(ModelNet40(partition='train', num_points=args.num_points), num_workers=8,
@@ -47,25 +47,14 @@ def train(args, io):
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
-    # if args.cuda:
-    #     torch.backends.cuda.preferred_linalg_library('magma')
 
     # Try to load models
-    if args.model == 'pointnet':
-        model = PointNet(args).to(device)
-    elif args.model == 'dgcnn':
-        model = DGCNN(args).to(device)
-    elif args.model == 'canonical_mlp':
-        model = CanonicalMLP(args).to(device)
-    elif args.model == 'hybrid_dgcnn':
-        model = HybridDGCNN(args).to(device)  # <-- Add this line
-    elif args.model == 'hierarchical_canonical':
+    if args.model == 'hierarchical_canonical':
         model = HierarchicalCanonicalNet(
             sampling=args.sampling,
             k=args.k,
             dropout=args.dropout,
-            patch_mlps=args.patch_mlps  # <--- Make sure this line is here!
-            # You can also pass patch_mlps and final_mlp_dims here if you add them to argparse
+            patch_mlps=args.patch_mlps
         ).to(device)
     elif args.model == 'hierarchical_spectral':
         model = HierarchicalSpectralNet(
@@ -81,15 +70,21 @@ def train(args, io):
     model = nn.DataParallel(model)
     print("Let's use", torch.cuda.device_count(), "GPUs!")
 
+    # --- THE CLEAN OPTIMIZER AND SCHEDULER LOGIC ---
     if args.use_sgd:
         print("Use SGD")
-        opt = optim.SGD(model.parameters(), lr=args.lr*100, momentum=args.momentum, weight_decay=1e-4)
+        start_lr = args.lr * 100
+        opt = optim.SGD(model.parameters(), lr=start_lr, momentum=args.momentum, weight_decay=1e-4)
     else:
         print("Use Adam")
-        opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        start_lr = args.lr
+        opt = optim.Adam(model.parameters(), lr=start_lr, weight_decay=1e-4)
 
-    scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=args.lr)
-    
+    # Automatically set the minimum LR to 1% of the starting LR
+    min_lr = start_lr * 0.001
+    scheduler = CosineAnnealingLR(opt, args.epochs, eta_min=min_lr)
+    # -----------------------------------------------
+
     criterion = cal_loss
 
     best_test_acc = 0
@@ -111,14 +106,11 @@ def train(args, io):
             logits = model(data)
             loss = criterion(logits, label)
 
-            # --- ADD THIS: The Fail-Fast Hard Stop ---
             if torch.isnan(loss):
                 print(f"\nFATAL ERROR: NaN loss detected at Epoch {epoch}!")
                 print("Killing the Slurm job to save cluster compute time.")
-                # Optional: tell W&B the run failed before exiting
                 wandb.run.summary["status"] = "failed_due_to_nan"
                 sys.exit(1)
-                # -----------------------------------------
 
             loss.backward()
             opt.step()
@@ -132,19 +124,19 @@ def train(args, io):
         train_true = np.concatenate(train_true)
         train_pred = np.concatenate(train_pred)
         outstr = 'Train %d, loss: %.6f, train acc: %.6f, train avg acc: %.6f' % (epoch,
-                                                                                 train_loss*1.0/count,
+                                                                                 train_loss * 1.0 / count,
                                                                                  metrics.accuracy_score(
                                                                                      train_true, train_pred),
                                                                                  metrics.balanced_accuracy_score(
                                                                                      train_true, train_pred))
         io.cprint(outstr)
-        # Log Training Metrics to W&B
         wandb.log({
             "epoch": epoch,
             "train/loss": train_loss * 1.0 / count,
             "train/acc": metrics.accuracy_score(train_true, train_pred),
             "train/avg_acc": metrics.balanced_accuracy_score(train_true, train_pred)
-        })  # <-- No step argument here!
+        })
+
         ####################
         # Test
         ####################
@@ -164,26 +156,29 @@ def train(args, io):
             test_loss += loss.item() * batch_size
             test_true.append(label.cpu().numpy())
             test_pred.append(preds.detach().cpu().numpy())
+
         test_true = np.concatenate(test_true)
         test_pred = np.concatenate(test_pred)
         test_acc = metrics.accuracy_score(test_true, test_pred)
         avg_per_class_acc = metrics.balanced_accuracy_score(test_true, test_pred)
         outstr = 'Test %d, loss: %.6f, test acc: %.6f, test avg acc: %.6f' % (epoch,
-                                                                              test_loss*1.0/count,
+                                                                              test_loss * 1.0 / count,
                                                                               test_acc,
                                                                               avg_per_class_acc)
         io.cprint(outstr)
+
         if test_acc >= best_test_acc:
             best_test_acc = test_acc
             torch.save(model.state_dict(), 'checkpoints/%s/models/model.pt' % args.exp_name)
-            # Log Testing Metrics to W&B
-            wandb.log({
-                "epoch": epoch,  # <-- Make sure to include epoch here too
-                "test/loss": test_loss * 1.0 / count,
-                "test/acc": test_acc,
-                "test/avg_acc": avg_per_class_acc,
-                "test/best_acc": best_test_acc
-            })  # <-- No step argument here!
+
+        wandb.log({
+            "epoch": epoch,
+            "test/loss": test_loss * 1.0 / count,
+            "test/acc": test_acc,
+            "test/avg_acc": avg_per_class_acc,
+            "test/best_acc": best_test_acc,
+            "lr": opt.param_groups[0]['lr']
+        })
 
 
 def test(args, io):
@@ -191,25 +186,13 @@ def test(args, io):
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
-    if args.cuda:
-        torch.backends.cuda.preferred_linalg_library('magma')
 
-    # Try to load models
-    if args.model == 'pointnet':
-        model = PointNet(args).to(device)
-    elif args.model == 'dgcnn':
-        model = DGCNN(args).to(device)
-    elif args.model == 'canonical_mlp':
-        model = CanonicalMLP(args).to(device)
-    elif args.model == 'hybrid_dgcnn':
-        model = HybridDGCNN(args).to(device)  # <-- Add this line
-    elif args.model == 'hierarchical_canonical':
+    if args.model == 'hierarchical_canonical':
         model = HierarchicalCanonicalNet(
             sampling=args.sampling,
             k=args.k,
             dropout=args.dropout,
-            patch_mlps=args.patch_mlps  # <--- Make sure this line is here!
-            # You can also pass patch_mlps and final_mlp_dims here if you add them to argparse
+            patch_mlps=args.patch_mlps
         ).to(device)
     elif args.model == 'hierarchical_spectral':
         model = HierarchicalSpectralNet(
@@ -224,7 +207,6 @@ def test(args, io):
 
     model = nn.DataParallel(model)
 
-    # Best practice: use weights_only=True for safer loading
     model.load_state_dict(torch.load(args.model_path, weights_only=True))
     model = model.eval()
     test_acc = 0.0
@@ -232,7 +214,6 @@ def test(args, io):
     test_true = []
     test_pred = []
     for data, label in test_loader:
-
         data, label = data.to(device), label.to(device).squeeze()
         data = data.permute(0, 2, 1)
         batch_size = data.size()[0]
@@ -240,35 +221,32 @@ def test(args, io):
         preds = logits.max(dim=1)[1]
         test_true.append(label.cpu().numpy())
         test_pred.append(preds.detach().cpu().numpy())
+
     test_true = np.concatenate(test_true)
     test_pred = np.concatenate(test_pred)
     test_acc = metrics.accuracy_score(test_true, test_pred)
     avg_per_class_acc = metrics.balanced_accuracy_score(test_true, test_pred)
-    outstr = 'Test :: test acc: %.6f, test avg acc: %.6f'%(test_acc, avg_per_class_acc)
+    outstr = 'Test :: test acc: %.6f, test avg acc: %.6f' % (test_acc, avg_per_class_acc)
     io.cprint(outstr)
 
 
 if __name__ == "__main__":
-    # Training settings
     parser = argparse.ArgumentParser(description='Point Cloud Recognition')
     parser.add_argument('--exp_name', type=str, default='exp', metavar='N',
                         help='Name of the experiment')
     parser.add_argument('--model', type=str, default='dgcnn', metavar='N',
                         choices=['pointnet', 'dgcnn', 'canonical_mlp', 'hybrid_dgcnn', 'hierarchical_canonical',
                                  'hierarchical_spectral'],
-                        help='Model to use, [pointnet, dgcnn, canonical_mlp, hybrid_dgcnn, hierarchical_canonical, hierarchical_spectral]')
+                        help='Model to use')
     parser.add_argument('--sigma_kernel', type=float, default=1.0,
                         help='Sigma for the Gaussian kernel in the spectral Fiedler computation')
-    # Example of adding a custom argument for the new model
-    parser.add_argument('--sampling', type=int, nargs='+', default=[512, 128, 32],
+    parser.add_argument('--sampling', type=ast.literal_eval, default=[512, 128, 32],
                         help='Hierarchical downsampling steps')
     parser.add_argument('--patch_mlp_dims', type=int, nargs='+', default=[64, 64],
-                        help='Dimensions for the initial patch MLP layers (e.g., --patch_mlp_dims 64 64 128)')
-    # --- ADD THIS NEW BLOCK ---
+                        help='Dimensions for the initial patch MLP layers')
     parser.add_argument('--patch_mlps', type=ast.literal_eval,
                         default=[[64, 64, 128], [128, 128, 256], [256, 512, 1024]],
                         help='Nested list of MLP dimensions for the hierarchical stages')
-    # --------------------------
     parser.add_argument('--dataset', type=str, default='modelnet40', metavar='N',
                         choices=['modelnet40'])
     parser.add_argument('--batch_size', type=int, default=32, metavar='batch_size',
@@ -277,18 +255,21 @@ if __name__ == "__main__":
                         help='Size of batch)')
     parser.add_argument('--epochs', type=int, default=250, metavar='N',
                         help='number of episode to train ')
-    parser.add_argument('--use_sgd', type=bool, default=True,
-                        help='Use SGD')
+
+    # Booleans are now proper flags.
+    parser.add_argument('--use_sgd', action='store_true',
+                        help='Use SGD (Default is Adam)')
+    parser.add_argument('--eval', action='store_true',
+                        help='evaluate the model')
+    parser.add_argument('--no_cuda', action='store_true',
+                        help='enables CUDA training')
+
     parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
-                        help='learning rate (default: 0.001, 0.1 if using sgd)')
+                        help='learning rate')
     parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                         help='SGD momentum (default: 0.9)')
-    parser.add_argument('--no_cuda', type=bool, default=False,
-                        help='enables CUDA training')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
                         help='random seed (default: 1)')
-    parser.add_argument('--eval', type=bool,  default=False,
-                        help='evaluate the model')
     parser.add_argument('--num_points', type=int, default=1024,
                         help='num of points to use')
     parser.add_argument('--dropout', type=float, default=0.5,
@@ -301,13 +282,10 @@ if __name__ == "__main__":
                         help='Pretrained model path')
     args = parser.parse_args()
 
-    # Initialize W&B
     wandb.init(project="modelnet40-canon", name=args.exp_name, config=vars(args))
 
-    # --- ADD THESE TWO LINES ---
     wandb.define_metric("epoch")
     wandb.define_metric("*", step_metric="epoch")
-    # ---------------------------
 
     _init_()
 
