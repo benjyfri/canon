@@ -3,40 +3,43 @@ import wandb
 
 def main():
     sweep_config = {
-        'name': 'Point_Transformer_PCA_Refined',
+        'name': 'Point_Transformer_PCA_A40_Optimized',
         'program': 'main.py',
         'method': 'bayes',
         'metric': {'name': 'test/best_acc', 'goal': 'maximize'},
         'early_terminate': {
             'type': 'hyperband',
-            'min_iter': 20,
+            # Bumped min_iter to 30 to give regularized models time to stabilize
+            'min_iter': 30,
             'eta': 2
         },
         'parameters': {
-            'exp_name': {'value': 'pt_pca_bayes_sweep'},
+            'exp_name': {'value': 'pt_pca_05'},
             'model': {'value': 'point_transformer'},
             'canon_method': {'value': 'pca'},
-            'epochs': {'value': 50},
+
+            # --- CRITICAL FIX: Give the model time to learn with regularization ---
+            'epochs': {'value': 150},
 
             # --- Optimizer & LR ---
-            # Assuming you add a '--weight_decay' flag to your argparse
-            'lr': {'distribution': 'log_uniform_values', 'min': 3e-4, 'max': 3e-3},
-            'weight_decay': {'values': [1e-5, 3e-5, 1e-4, 1e-2, 3e-2]},
-            'batch_size': {'values': [16, 24, 32]},
+            # Higher batch sizes allow for safely pushing higher learning rates
+            'lr': {'distribution': 'log_uniform_values', 'min': 1e-4, 'max': 5e-3},
+            'weight_decay': {'values': [0.01, 0.03, 0.05]},
 
-            # --- Architecture (Kept < 1.5M params) ---
-            # Locked heads to 6 to prevent divisibility crashes.
-            # 144/6=24 | 192/6=32 | 216/6=36
-            'trans_dim': {'values': [144, 192, 216]},
-            'trans_depth': {'values': [3, 4, 6]},
+            # --- Hardware Utilization (Pushing the A40 VRAM) ---
+            # If 256 throws an OOM, W&B will just fail that run and adapt.
+            'batch_size': {'value': 32},
+
+            # --- Architecture (Locked to known good capacity) ---
+            'trans_dim': {'value': 216},
+            'trans_depth': {'value': 6},
             'trans_heads': {'value': 6},
 
-            # --- Regularization ---
-            'dropout': {'values': [0.0, 0.1, 0.2, 0.3]},
-            # Assuming you add a '--drop_path_rate' flag to your argparse
-            'drop_path_rate': {'values': [0.0, 0.05, 0.1, 0.2]},
-            # Assuming you add a '--label_smoothing' flag to your argparse
-            'label_smoothing': {'values': [0.0, 0.1]}
+            # --- Regularization (Forced Non-Zero) ---
+            # Targeting the overfitting/confidence issue explicitly
+            'dropout': {'values': [0.2, 0.35, 0.5]},
+            'drop_path_rate': {'values': [0.05, 0.1, 0.2]},
+            'label_smoothing': {'values': [0.1, 0.2]}
         },
         'command': ['${env}', 'python', '${program}', '${args}']
     }
