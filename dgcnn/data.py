@@ -60,24 +60,23 @@ def jitter_pointcloud(pointcloud, sigma=0.01, clip=0.02):
     return pointcloud
 
 
-# --- NEW: Self-Centering Rotation Function ---
-def rotate_pointcloud(pointcloud):
-    # 1. Find the current center of the point cloud
-    centroid = np.mean(pointcloud, axis=0)
+from scipy.spatial.transform import Rotation as R
 
-    # 2. Shift to the origin
+
+def rotate_pointcloud_so3(pointcloud):
+    """Applies a random full SO(3) rotation prior to canonicalization."""
+    # 1. Find center
+    centroid = np.mean(pointcloud, axis=0)
     centered_pc = pointcloud - centroid
 
-    # 3. Apply the random Y-axis rotation
-    theta = np.pi * 2 * np.random.uniform()
-    rotation_matrix = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
-    centered_pc[:, [0, 2]] = centered_pc[:, [0, 2]].dot(rotation_matrix)
+    # 2. Generate random SO(3) rotation matrix
+    rotation_matrix = R.random().as_matrix()
 
-    # 4. Shift back to the original translated position
-    final_pc = centered_pc + centroid
+    # 3. Apply rotation
+    rotated_pc = np.dot(centered_pc, rotation_matrix.T)
 
-    return final_pc.astype('float32')
-
+    # 4. Shift back
+    return (rotated_pc + centroid).astype('float32')
 
 class ModelNet40(Dataset):
     def __init__(self, num_points, partition='train'):
@@ -89,8 +88,12 @@ class ModelNet40(Dataset):
         pointcloud = self.data[item][:self.num_points]
         label = self.label[item]
         if self.partition == 'train':
+            # Anisotropic scaling and translation
             pointcloud = translate_pointcloud(pointcloud)
-            pointcloud = rotate_pointcloud(pointcloud)
+            # FULL SO(3) Rotation (Stress-tests the canonicalizer)
+            pointcloud = rotate_pointcloud_so3(pointcloud)
+            # Enable the previously ignored Gaussian jittering
+            pointcloud = jitter_pointcloud(pointcloud, sigma=0.01, clip=0.02)
             np.random.shuffle(pointcloud)
         return pointcloud, label
 
