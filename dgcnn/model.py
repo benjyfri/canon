@@ -35,10 +35,6 @@ class Canonicalizer:
 
     @staticmethod
     def _center(pc): return pc - pc.mean(dim=1, keepdim=True)
-
-    @staticmethod
-    def _safe_normalize(v, eps=1e-8): return v / (v.norm(dim=-1, keepdim=True) + eps)
-
     @staticmethod
     def _enforce_so3(R):
         det = torch.linalg.det(R)
@@ -89,10 +85,7 @@ class Canonicalizer:
         device = pc.device
         centered = Canonicalizer._center(pc)
 
-        max_radii = (torch.max(torch.linalg.norm(centered, axis=2), axis=1))[0].unsqueeze(-1).unsqueeze(-1)
-        normalized_patches = centered / torch.clamp(max_radii, min=epsilon)
-
-        perm = Canonicalizer.get_fiedler_permutation(normalized_patches, sigma_kernel=sigma_kernel, epsilon=1e-8)
+        perm = Canonicalizer.get_fiedler_permutation(centered, sigma_kernel=sigma_kernel, epsilon=1e-8)
         pc_ord = torch.gather(centered, 1, perm.unsqueeze(-1).expand(-1, -1, D))
         weights = torch.linspace(-1, 1, N, device=device).view(1, N, 1)
         moment_1 = (pc_ord * weights).sum(dim=1, keepdim=True)

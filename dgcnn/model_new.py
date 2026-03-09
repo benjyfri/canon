@@ -15,10 +15,8 @@ class Canonicalizer:
     """
 
     @staticmethod
-    def center_and_normalize(pc, eps=1e-8):
+    def center(pc, eps=1e-8):
         pc = pc - pc.mean(dim=1, keepdim=True)
-        max_norm = torch.max(torch.linalg.norm(pc, dim=2), dim=1, keepdim=True)[0]
-        pc = pc / torch.clamp(max_norm, min=eps).unsqueeze(-1)
         return pc
 
     @staticmethod
@@ -148,7 +146,7 @@ class CanonicalizationWrapper(nn.Module):
         xyz = x[..., :3]
         features = x[..., 3:] if x.shape[-1] > 3 else None
 
-        xyz = Canonicalizer.center_and_normalize(xyz)
+        xyz = Canonicalizer.center(xyz)
 
         if self.method == 'pca':
             xyz_canon, perm, R_final = Canonicalizer.pca_skew(xyz)
