@@ -47,7 +47,12 @@ def load_data(partition):
 
 
 def translate_pointcloud(pointcloud):
-    xyz1 = np.random.uniform(low=2. / 3., high=3. / 2., size=[3])
+    # CHANGED: size=[3] to size=[1] for xyz1.
+    # This applies the exact same scale factor to X, Y, and Z (Isotropic Scaling).
+    # This prevents the PCA eigenvalues from swapping!
+    xyz1 = np.random.uniform(low=2. / 3., high=3. / 2., size=[1])
+
+    # Translation can safely remain independent across the 3 axes
     xyz2 = np.random.uniform(low=-0.2, high=0.2, size=[3])
 
     translated_pointcloud = np.add(np.multiply(pointcloud, xyz1), xyz2).astype('float32')
